@@ -1,0 +1,265 @@
+
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+#root { font-family: var(--font-sans); display: flex; flex-direction: column; align-items: center; padding: 1.5rem 0; }
+#game-box { width: 480px; display: flex; flex-direction: column; gap: 10px; }
+canvas { display: block; width: 480px; height: 480px; border-radius: var(--border-radius-lg); border: 0.5px solid var(--color-border-tertiary); background: var(--color-background-secondary); cursor: none; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.stat { background: var(--color-background-secondary); border-radius: var(--border-radius-md); padding: 9px 12px; }
+.stat-label { font-size: 12px; color: var(--color-text-secondary); margin-bottom: 3px; }
+.stat-value { font-size: 20px; font-weight: 500; color: var(--color-text-primary); }
+.controls { display: flex; align-items: center; justify-content: space-between; }
+.ctrl-hint { font-size: 12px; color: var(--color-text-secondary); }
+button { font-family: var(--font-sans); font-size: 12px; padding: 5px 14px; border-radius: var(--border-radius-md); border: 0.5px solid var(--color-border-secondary); background: transparent; color: var(--color-text-primary); cursor: pointer; }
+button:hover { background: var(--color-background-secondary); }
+button:active { transform: scale(0.98); }
+.diff-btns { display: flex; gap: 5px; }
+.diff-btn { padding: 4px 10px; font-size: 11px; }
+.diff-btn.active { background: var(--color-background-info); color: var(--color-text-info); border-color: transparent; }
+#angle-bar-wrap { height: 3px; background: var(--color-border-tertiary); border-radius: 2px; overflow: hidden; }
+#angle-bar { height: 100%; width: 0%; background: #1D9E75; border-radius: 2px; }
+</style>
+
+<div id="root">
+  <h2 class="sr-only">Cart Pole balancing game — use arrow keys or mouse to keep the pole upright</h2>
+  <div id="game-box">
+    <canvas id="c" width="480" height="480"></canvas>
+    <div class="stats">
+      <div class="stat"><div class="stat-label">Time (s)</div><div class="stat-value" id="s-time">0.0</div></div>
+      <div class="stat"><div class="stat-label">Best (s)</div><div class="stat-value" id="s-best">0.0</div></div>
+      <div class="stat"><div class="stat-label">Angle (°)</div><div class="stat-value" id="s-angle">0.0</div></div>
+    </div>
+    <div id="angle-bar-wrap"><div id="angle-bar"></div></div>
+    <div class="controls">
+      <span class="ctrl-hint">← → keys or mouse/touch to push cart</span>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <div class="diff-btns">
+          <button class="diff-btn active" id="d-easy"   onclick="setDiff('easy')">Easy</button>
+          <button class="diff-btn"        id="d-med"    onclick="setDiff('medium')">Medium</button>
+          <button class="diff-btn"        id="d-hard"   onclick="setDiff('hard')">Hard</button>
+        </div>
+        <button onclick="restart()">Restart</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const W = 480, H = 480;
+const PX_PER_M = 26;
+
+const DIFFS = {
+  easy:   { poleLen:5.0, g:3.0, cartMass:0.5, poleMass:0.1, maxForce:22, mouseSens:0.14, failAngle:90 },
+  medium: { poleLen:3.0, g:5.0, cartMass:0.4, poleMass:0.1, maxForce:18, mouseSens:0.11, failAngle:90 },
+  hard:   { poleLen:1.6, g:7.0, cartMass:0.3, poleMass:0.1, maxForce:14, mouseSens:0.09, failAngle:90 },
+};
+let diff = DIFFS.easy;
+
+const dt = 1/60;
+let state, running, startTime, elapsed, best=0, animId;
+let leftDown=false, rightDown=false, mouseX=null, touchX=null;
+
+/* Fixed pixel height for the pole — always tall regardless of physics poleLen */
+const POLE_PX = 300;
+
+/* Cart sits at this Y so the pole has room above */
+const GROUND_Y = H * 0.82;
+
+function initState() {
+  return { x:0, dx:0, theta:(Math.random()-0.5)*0.04, dtheta:0 };
+}
+
+function restart() {
+  cancelAnimationFrame(animId);
+  state = initState();
+  running=true; startTime=null; elapsed=0;
+  document.getElementById('s-time').textContent='0.0';
+  animId = requestAnimationFrame(loop);
+}
+
+function setDiff(d) {
+  diff = DIFFS[d];
+  document.querySelectorAll('.diff-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById({easy:'d-easy',medium:'d-med',hard:'d-hard'}[d]).classList.add('active');
+  restart();
+}
+
+function physics(s, force) {
+  const {poleLen:L, cartMass:M, poleMass:m, g} = diff;
+  const cosT=Math.cos(s.theta), sinT=Math.sin(s.theta);
+  const total=M+m;
+  const temp=(force + m*L*s.dtheta*s.dtheta*sinT)/total;
+  const ddtheta=(g*sinT - cosT*temp) / (L*(4/3 - m*cosT*cosT/total));
+  const ddx=temp - m*L*ddtheta*cosT/total;
+  return {
+    x:     s.x      + s.dx*dt,
+    dx:    s.dx     + ddx*dt,
+    theta: s.theta  + s.dtheta*dt,
+    dtheta:s.dtheta + ddtheta*dt,
+  };
+}
+
+function cartPx() { return W/2 + state.x * PX_PER_M; }
+
+function getForce() {
+  if (leftDown)  return -diff.maxForce;
+  if (rightDown) return  diff.maxForce;
+  const ref = touchX !== null ? touchX : mouseX;
+  if (ref !== null) {
+    const delta = ref - cartPx();
+    return Math.max(-diff.maxForce, Math.min(diff.maxForce, delta * diff.mouseSens));
+  }
+  return 0;
+}
+
+const isDark = () => window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+function draw(failed) {
+  ctx.clearRect(0,0,W,H);
+  const dark=isDark();
+  const C = dark
+    ? {track:'#444441',cart:'#B4B2A9',wheel:'#888780',pole:'#5DCAA5',bob:'#1D9E75',warn:'#EF9F27',fail:'#F09595',text:'#D3D1C7'}
+    : {track:'#D3D1C7',cart:'#5F5E5A',wheel:'#888780',pole:'#0F6E56',bob:'#1D9E75',warn:'#BA7517',fail:'#D85A30',text:'#444441'};
+
+  const groundY=GROUND_Y, cx=cartPx();
+  const cartW=80, cartH=30, wheelR=11;
+  const cartY=groundY-wheelR*2-cartH/2;
+
+  /* track */
+  ctx.strokeStyle=C.track; ctx.lineWidth=2.5;
+  ctx.beginPath(); ctx.moveTo(0,groundY+wheelR*1.5); ctx.lineTo(W,groundY+wheelR*1.5); ctx.stroke();
+  ctx.lineWidth=1.5;
+  for (let i=0;i<W+20;i+=18){
+    ctx.beginPath(); ctx.moveTo(i,groundY+wheelR*1.5); ctx.lineTo(i+10,groundY+wheelR*2); ctx.stroke();
+  }
+
+  /* pole */
+  const pbX=cx, pbY=cartY-cartH/2;
+  const ptX=pbX+Math.sin(state.theta)*POLE_PX;
+  const ptY=pbY-Math.cos(state.theta)*POLE_PX;
+  const failRad=Math.PI/2;
+  const ratio=Math.min(1,Math.abs(state.theta)/failRad);
+  const poleColor=failed?C.fail:ratio<0.45?C.pole:ratio<0.75?C.warn:C.fail;
+
+  ctx.strokeStyle=poleColor; ctx.lineWidth=8; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(pbX,pbY); ctx.lineTo(ptX,ptY); ctx.stroke();
+  ctx.fillStyle=poleColor;
+  ctx.beginPath(); ctx.arc(ptX,ptY,10,0,Math.PI*2); ctx.fill();
+
+  /* cart */
+  ctx.fillStyle=failed?C.fail:C.cart;
+  const r=7;
+  ctx.beginPath();
+  ctx.moveTo(cx-cartW/2+r, cartY-cartH/2);
+  ctx.arcTo(cx+cartW/2, cartY-cartH/2, cx+cartW/2, cartY+cartH/2, r);
+  ctx.arcTo(cx+cartW/2, cartY+cartH/2, cx-cartW/2, cartY+cartH/2, r);
+  ctx.arcTo(cx-cartW/2, cartY+cartH/2, cx-cartW/2, cartY-cartH/2, r);
+  ctx.arcTo(cx-cartW/2, cartY-cartH/2, cx+cartW/2, cartY-cartH/2, r);
+  ctx.closePath(); ctx.fill();
+
+  /* wheels */
+  const wy=groundY+wheelR*1.5-wheelR;
+  [cx-cartW*0.28, cx+cartW*0.28].forEach(wx=>{
+    ctx.fillStyle=C.wheel; ctx.beginPath(); ctx.arc(wx,wy,wheelR,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle=dark?'#2C2C2A':'#F1EFE8'; ctx.beginPath(); ctx.arc(wx,wy,wheelR*0.38,0,Math.PI*2); ctx.fill();
+  });
+
+  /* wall warning */
+  const wallM=50;
+  const wallPct=Math.min(1,Math.max(0,(Math.abs(cx-W/2)-(W/2-wallM)*0.5)/((W/2-wallM)*0.5)));
+  if (wallPct>0){
+    const wx2=state.x>0?W-wallM:wallM;
+    ctx.strokeStyle=`rgba(226,75,74,${wallPct*0.7})`; ctx.lineWidth=2.5;
+    ctx.setLineDash([7,5]);
+    ctx.beginPath(); ctx.moveTo(wx2,0); ctx.lineTo(wx2,H); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  /* mouse hint */
+  if (mouseX!==null && !failed){
+    const ay=cartY-cartH/2-10, dir=mouseX>cx?1:-1;
+    if (Math.abs(mouseX-cx)>8){
+      ctx.strokeStyle=dark?'rgba(180,178,169,0.2)':'rgba(95,94,90,0.15)';
+      ctx.lineWidth=1; ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.moveTo(mouseX,ay); ctx.lineTo(cx+dir*cartW*0.5,ay); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle=dark?'rgba(180,178,169,0.3)':'rgba(95,94,90,0.2)';
+      const ax=cx+dir*(cartW*0.5+8);
+      ctx.beginPath(); ctx.moveTo(ax,ay-5); ctx.lineTo(ax+dir*7,ay); ctx.lineTo(ax,ay+5); ctx.fill();
+    }
+  }
+
+  /* game over */
+  if (failed){
+    ctx.fillStyle=dark?'rgba(240,149,149,0.10)':'rgba(216,90,48,0.07)';
+    ctx.fillRect(0,0,W,H);
+    ctx.textAlign='center';
+    ctx.fillStyle=C.fail; ctx.font='500 22px var(--font-sans)';
+    ctx.fillText('Fell over!',W/2,H/2-16);
+    ctx.fillStyle=C.text; ctx.font='400 14px var(--font-sans)';
+    ctx.fillText(elapsed.toFixed(1)+'s'+(elapsed>=best&&elapsed>0?'  ★ new best':''),W/2,H/2+12);
+    ctx.fillStyle=dark?'rgba(180,178,169,0.5)':'rgba(95,94,90,0.5)';
+    ctx.font='400 12px var(--font-sans)';
+    ctx.fillText('click or press any key to restart',W/2,H/2+36);
+  }
+}
+
+function loop(ts){
+  if (!running) return;
+  if (!startTime) startTime=ts;
+  elapsed=(ts-startTime)/1000;
+
+  state=physics(state, getForce());
+
+  const cx=cartPx();
+  const failed=Math.abs(state.theta)>=Math.PI/2 || Math.abs(cx-W/2)>W/2-50;
+
+  document.getElementById('s-time').textContent=elapsed.toFixed(1);
+  document.getElementById('s-angle').textContent=(Math.abs(state.theta)*180/Math.PI).toFixed(1);
+  const pct=Math.min(100,Math.abs(state.theta)/(Math.PI/2)*100);
+  const bar=document.getElementById('angle-bar');
+  bar.style.width=pct+'%';
+  bar.style.background=pct<45?'#1D9E75':pct<75?'#EF9F27':'#E24B4A';
+
+  draw(failed);
+
+  if (failed){
+    running=false;
+    if (elapsed>best){ best=elapsed; document.getElementById('s-best').textContent=elapsed.toFixed(1); }
+    return;
+  }
+  animId=requestAnimationFrame(loop);
+}
+
+window.addEventListener('keydown',e=>{
+  if (e.key==='ArrowLeft'){leftDown=true;e.preventDefault();}
+  if (e.key==='ArrowRight'){rightDown=true;e.preventDefault();}
+  if (!running) restart();
+});
+window.addEventListener('keyup',e=>{
+  if (e.key==='ArrowLeft') leftDown=false;
+  if (e.key==='ArrowRight') rightDown=false;
+});
+canvas.addEventListener('mousemove',e=>{
+  const r=canvas.getBoundingClientRect();
+  mouseX=(e.clientX-r.left)*(W/r.width);
+});
+canvas.addEventListener('mouseleave',()=>{mouseX=null;});
+canvas.addEventListener('click',()=>{if(!running)restart();});
+canvas.addEventListener('touchstart',e=>{
+  e.preventDefault();
+  const r=canvas.getBoundingClientRect();
+  touchX=(e.touches[0].clientX-r.left)*(W/r.width);
+  if(!running)restart();
+},{passive:false});
+canvas.addEventListener('touchmove',e=>{
+  e.preventDefault();
+  const r=canvas.getBoundingClientRect();
+  touchX=(e.touches[0].clientX-r.left)*(W/r.width);
+},{passive:false});
+canvas.addEventListener('touchend',()=>{touchX=null;});
+
+restart();
+</script>
